@@ -1,22 +1,26 @@
-""" reformat_nist_sdf.py
+""" reformat_vgwd_sdf.py
 
-Reformat the NIST sdf file
+Reformat the VGWD sdf file (in NIST style)
 
 """
 
 from pathlib import Path
 import re
 import argparse
+import json
 import pandas as pd
 import numpy as np
 from typing import Iterator, List, Tuple
 from itertools import groupby
 from functools import partial
 from collections import defaultdict
+import ms_pred.common as common
 
 from rdkit import Chem
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 from tqdm import tqdm
+import multiprocess.context as ctx
+ctx._force_start_method('spawn')
 from pathos import multiprocessing as mp
 
 NAME_STRING = r"<(.*)>"
@@ -157,21 +161,23 @@ def process_sdf(line: Iterator):
                 peaks.append(peak_tuple)
             output_dict["Peaks"] = peaks
         elif name == "INCHIKEY":
+            # NO InchiKey annotation in VGWD
             output_dict[name] = data.strip()
         elif name == "FORMULA":
             # Should line up, but computing our way to be sure
             output_dict[name] = data.strip()
         elif name == "SYNONYMS":
             output_dict[name] = data.split("\n")[0].strip()
-        elif name == "NISTNO":
-            output_dict[name] = data
-            output_dict["spec_id"] = f"nist_{data}"
         else:
             output_dict[name] = data
 
     # Apply filter before converting
     if fails_filter(output_dict):
         return {}
+
+    # Get library ID in mol_block
+    spec_name = re.findall('Library ID= ([0-9]+)', mol_block)
+    output_dict["spec_id"] = f'vgwd_{spec_name[0]}'
 
     mol = Chem.MolFromMolBlock(mol_block)
     if mol is None or mol.GetNumAtoms() == 0:
@@ -184,6 +190,8 @@ def process_sdf(line: Iterator):
     output_dict['FORMULA'] = formula
     output_dict['INCHIKEY'] = inchikey
     output_dict['smiles'] = smi
+    output_dict['PRECURSOR M/Z'] = common.mass_from_smi(smi) + common.ion2mass['[M]+']
+    output_dict['PRECURSOR TYPE'] = '[M]+'
     return output_dict
 
 
@@ -196,11 +204,14 @@ def merge_data(collision_dict: dict):
         if base_dict is None:
             base_dict = sub_dict
         if energy in out_peaks:
-            print("Unexpected to see {energy} in {json.dumps(sub_dict, indent=2)}")
+            print(f"Unexpected to see {energy} in {json.dumps(sub_dict, indent=2)}")
             raise ValueError()
         out_peaks[energy] = np.array(sub_dict["Peaks"])
         energies.append(energy)
         num_peaks += len(out_peaks[energy])
+
+    # if 'nan' not in energies:
+    #     energies.append('nan')  # add a "nan" entry for merged spectrum
 
     base_dict["Peaks"] = out_peaks
     base_dict["COLLISION ENERGY"] = energies
@@ -211,7 +222,7 @@ def merge_data(collision_dict: dict):
     return (info_dict, peak_list)
 
 
-def dump_to_file(entry: tuple, out_folder) -> dict:
+def dump_fn(entry: tuple) -> (dict, dict):
     # Create output entry
     entry, peaks = entry
     output_name = entry["spec_id"]
@@ -220,20 +231,21 @@ def dump_to_file(entry: tuple, out_folder) -> dict:
     ionization = entry["PRECURSOR TYPE"]
     parent_mass = entry["PRECURSOR M/Z"]
     out_entry = {
-        "dataset": "nist2020",
+        "dataset": "vgwd2023",
         "spec": output_name,
         "name": common_name,
         "formula": formula,
         "ionization": ionization,
         "smiles": entry["smiles"],
         "inchikey": entry["INCHIKEY"],
+        "precursor": parent_mass,
+        "collision_energies": [k for k, v in peaks],
     }
 
     # create_output_file
     # All keys to exclude from the comments
     exclude_comments = {"Peaks"}
 
-    output_name = Path(out_folder) / f"{output_name}.ms"
     header_str = [
         f">compound {common_name}",
         f">formula {formula}",
@@ -254,11 +266,9 @@ def dump_to_file(entry: tuple, out_folder) -> dict:
         peak_list.append("\n".join(peak_entry))
 
     peak_str = "\n\n".join(peak_list)
-    with open(output_name, "w") as fp:
-        fp.write(header_str + "\n")
-        fp.write(comment_str + "\n\n")
-        fp.write(peak_str)
-    return out_entry
+    out_str = header_str + "\n" + comment_str + "\n\n" + peak_str
+
+    return out_entry, {f"{output_name}.ms": out_str}
 
 
 def read_sdf(input_file, debug=False):
@@ -279,33 +289,31 @@ def read_sdf(input_file, debug=False):
     return lines_to_process
 
 
-def fails_filter(entry, valid_adduct=("[M+H]+", "[M+Na]+", "[M+K]+",
-                                      "[M+H-H2O]+", "[M+NH4]+",
-                                      "[M+H-2H2O]+",),
+def fails_filter(entry, valid_adduct=list(common.ion2mass.keys()),
                  max_mass=1500,
                  ):
     """ fails_filter. """
-    if entry['PRECURSOR TYPE'] not in valid_adduct:
-        return True
+    # All GC-MS peaks are [M]+
+    # if entry['PRECURSOR TYPE'] not in valid_adduct:
+    #     return True
 
-    if float(entry['EXACT MASS']) > max_mass:
-        return True
+    # NO 'EXACT MASS' in annotation
+    # if 'EXACT MASS' not in entry or float(entry['EXACT MASS']) > max_mass:
+    #     return True
 
+    # NO 'INSTRUMENT TYPE' in annotation
     # QTOF, HCD,
-    if entry['INSTRUMENT TYPE'].upper() != "HCD":
-        return True
+    # if entry['INSTRUMENT TYPE'].upper() != "HCD":
+    #     return True
 
     form_els = get_els(entry['FORMULA'])
     if len(form_els.intersection(VALID_ELS)) != len(form_els):
         return True
 
-
     return False
         
 
 if __name__ == "__main__":
-
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", default=False, action="store_true")
     parser.add_argument("--input-file", action="store",
@@ -327,11 +335,10 @@ if __name__ == "__main__":
     target_directory = Path(target_directory)
 
     target_directory.mkdir(exist_ok=True, parents=True)
-    target_ms = target_directory / "spec_files"
+    target_ms = target_directory / "spec_files.hdf5"
     target_mgf = target_directory / "mgf_files"
     target_labels = target_directory / "labels.tsv"
 
-    target_ms.mkdir(exist_ok=True, parents=True)
     target_mgf.mkdir(exist_ok=True, parents=True)
 
     lines_to_process = read_sdf(input_file, debug=debug)
@@ -345,51 +352,46 @@ if __name__ == "__main__":
                                         1000, max_cpu=workers) 
 
     # Reformat output dicts
-    # {inchikey: {adduct : {instrumnet : {collision energy : spectra} }  }}
+    # {inchikey: {adduct : spectra} }
     parsed_data = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {})))
+        lambda: defaultdict(lambda: {})
     )
 
 
     print("Shuffling dict before merge")
-    spec_types = []
     for output_dict in tqdm(output_dicts):
         if len(output_dict) == 0:
             continue
         inchikey = output_dict["INCHIKEY"]
         precusor_type = output_dict["PRECURSOR TYPE"]
-        instrument_type = output_dict["INSTRUMENT TYPE"]
-        collision_energy = output_dict["COLLISION ENERGY"]
-        spec_type = output_dict["SPECTRUM TYPE"]
-        spec_types.append(spec_type)
-        col_energies = re.findall(COLLISION_REGEX, collision_energy)
-        if len(col_energies) == 0:
-            print(f"Skipping entry {output_dict} due to no col energy")
-            continue
-        collision_energy = col_energies[-1]
-        parsed_data[inchikey][precusor_type][instrument_type][
-            collision_energy
-        ] = output_dict
+        parsed_data[inchikey][precusor_type] = output_dict
 
     # merge entries
     merged_entries = []
     print("Merging dicts")
     for inchikey, adduct_dict in tqdm(parsed_data.items()):
-        for adduct, instrument_dict in adduct_dict.items():
-            for instrument, collision_dict in instrument_dict.items():
-                output_dict = merge_data(collision_dict)
-                merged_entries.append(output_dict)
+        for adduct, data_dict in adduct_dict.items():
+            output_dict = merge_data({'nan': data_dict})
+            merged_entries.append(output_dict)
 
-    print(f"Parallelizing export to file")
-    dump_fn = partial(dump_to_file, out_folder=target_ms)
+    print(f"Export to file")
     if debug:
-        output_entries = [dump_fn(i) for i in merged_entries]
+        output_tuples = [dump_fn(i) for i in merged_entries]
     else:
-        output_entries = chunked_parallel(merged_entries, dump_fn, 10000,
+        output_tuples = chunked_parallel(merged_entries, dump_fn, 10000,
                                           max_cpu=workers)
+    output_entries = []
+    ms_entries = {}
+    for tup in output_tuples:
+        output_entries.append(tup[0])
+        ms_entries.update(tup[1])
+
+    h5 = common.HDF5Dataset(target_ms, 'w')
+    h5.write_dict(ms_entries)
+    h5.close()
 
     mgf_out = build_mgf_str(merged_entries)
-    open(target_mgf / "nist_all.mgf", "w").write(mgf_out)
+    open(target_mgf / "vgwd_all.mgf", "w").write(mgf_out)
 
     df = pd.DataFrame(output_entries)
 
