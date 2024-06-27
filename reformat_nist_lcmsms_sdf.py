@@ -366,7 +366,7 @@ if __name__ == "__main__":
         if len(col_energies) == 0:
             print(f"Skipping entry {output_dict} due to no col energy")
             continue
-        collision_energy = col_energies[-1]
+        collision_energy = col_energies[0]  # 0: take NCE; -1: take eV
         parsed_data[inchikey][precusor_type][instrument_type][
             collision_energy
         ] = output_dict
