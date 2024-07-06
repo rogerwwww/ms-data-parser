@@ -357,17 +357,24 @@ if __name__ == "__main__":
         if len(output_dict) == 0:
             continue
         inchikey = output_dict["INCHIKEY"]
-        precusor_type = output_dict["PRECURSOR TYPE"]
+        precursor_type = output_dict["PRECURSOR TYPE"]
         instrument_type = output_dict["INSTRUMENT TYPE"]
         collision_energy = output_dict["COLLISION ENERGY"]
         spec_type = output_dict["SPECTRUM TYPE"]
+        precursor_mass = output_dict["PRECURSOR M/Z"]
         spec_types.append(spec_type)
         col_energies = re.findall(COLLISION_REGEX, collision_energy)
         if len(col_energies) == 0:
             print(f"Skipping entry {output_dict} due to no col energy")
             continue
-        collision_energy = col_energies[0]  # 0: take NCE; -1: take eV
-        parsed_data[inchikey][precusor_type][instrument_type][
+        collision_energy = col_energies[-1]  # take eV
+        # if len(col_energies) == 2:
+        #     collision_energy = col_energies[-1]  # take eV
+        # elif len(col_energies) == 1:  # only NCE exists
+        #     collision_energy = f'{float(col_energies[0]) * float(precursor_mass) / 500:.1f}'
+        # else:
+        #     raise ValueError('collision energy values not understood:', collision_energy)
+        parsed_data[inchikey][precursor_type][instrument_type][
             collision_energy
         ] = output_dict
 
