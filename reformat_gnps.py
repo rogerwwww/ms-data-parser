@@ -223,7 +223,7 @@ def merge_data(collision_dict: dict):
     return (info_dict, peak_list)
 
 
-def dump_to_file(entry: tuple, out_folder) -> dict:
+def dump_fn(entry: tuple) -> (dict, dict):
     # Create output entry
     entry, peaks = entry
     output_name = entry["spec_id"]
@@ -240,13 +240,13 @@ def dump_to_file(entry: tuple, out_folder) -> dict:
         "smiles": entry["Smiles"],
         "inchikey": entry["InChIKey"],
         "precursor": parent_mass,
+        "collision_energies": [k for k, v in peaks],
     }
 
     # create_output_file
     # All keys to exclude from the comments
     exclude_comments = {"Peaks"}
 
-    output_name = Path(out_folder) / f"{output_name}.ms"
     header_str = [
         f">compound {common_name}",
         f">formula {formula}",
@@ -267,11 +267,9 @@ def dump_to_file(entry: tuple, out_folder) -> dict:
         peak_list.append("\n".join(peak_entry))
 
     peak_str = "\n\n".join(peak_list)
-    with open(output_name, "w") as fp:
-        fp.write(header_str + "\n")
-        fp.write(comment_str + "\n\n")
-        fp.write(peak_str)
-    return out_entry
+    out_str = header_str + "\n" + comment_str + "\n\n" + peak_str
+
+    return out_entry, {f"{output_name}.ms": out_str}
 
 
 def read_mgf(input_file, debug=False):
@@ -340,10 +338,8 @@ if __name__ == "__main__":
         target_directory = Path(target_directory)
 
     target_directory.mkdir(exist_ok=True, parents=True)
-    target_ms = target_directory / "spec_files"
+    target_ms = target_directory / "spec_files.hdf5"
     target_labels = target_directory / "labels.tsv"
-
-    target_ms.mkdir(exist_ok=True, parents=True)
 
     groups_to_process = read_mgf(spec_file, debug=debug)
     meta_data = pd.read_csv(meta_file)
@@ -409,13 +405,22 @@ if __name__ == "__main__":
                         output_dict = merge_data(colli_eng_type)
                         merged_entries.append(output_dict)
 
-    print(f"Parallelizing export to file")
-    dump_fn = partial(dump_to_file, out_folder=target_ms)
+    print(f"Export to file")
     if debug:
-        output_entries = [dump_fn(i) for i in merged_entries]
+        output_tuples = [dump_fn(i) for i in merged_entries]
     else:
-        output_entries = chunked_parallel(merged_entries, dump_fn, 10000,
+        output_tuples = chunked_parallel(merged_entries, dump_fn, 10000,
                                           max_cpu=workers)
+
+    output_entries = []
+    ms_entries = {}
+    for tup in output_tuples:
+        output_entries.append(tup[0])
+        ms_entries.update(tup[1])
+
+    h5 = common.HDF5Dataset(target_ms, 'w')
+    h5.write_dict(ms_entries)
+    h5.close()
 
     df = pd.DataFrame(output_entries)
 
