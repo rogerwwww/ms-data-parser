@@ -31,6 +31,23 @@ ION_MAP = {'[M+H-H2O]+': '[M-H2O+H]+',
            '[M+NH4]+': '[M+H3N+H]+',
            '[M+H-2H2O]+': '[M-H4O2+H]+',}
 
+INSTRUMENT_MAP_NIST23 = {
+    "HCD": "Orbitrap",
+    "IT-FT/ion trap with FTMS": "IT-FT",
+    "Q-TOF": "QTOF",
+}
+
+# only did NIST2020 HCD
+INSTRUMENT_MAP_NIST20 = {
+    "HCD": "Orbitrap"
+}
+
+
+DATASET_INSTRUMENT_MAP = {
+    "nist2020": INSTRUMENT_MAP_NIST20,
+    "nist2023": INSTRUMENT_MAP_NIST23,
+}
+
 
 def get_els(form):
     return {i[0] for i in re.findall("([A-Z][a-z]*)([0-9]*)", form)}
@@ -73,6 +90,7 @@ def build_mgf_str(
     merge_charges=True,
     parent_mass_keys=("PEPMASS", "parentmass", "PRECURSOR_MZ"),
     precision=4,
+    dataset="nist2020",
 ) -> str:
     """build_mgf_str.
 
@@ -83,6 +101,7 @@ def build_mgf_str(
         str:
     """
     entries = []
+    instrument_map = DATASET_INSTRUMENT_MAP[dataset]
     for meta, spec in tqdm(meta_spec_list):
         str_rows = ["BEGIN IONS"]
 
@@ -134,11 +153,12 @@ def uncharged_formula(mol, mol_type="mol") -> str:
     return re.findall(r"^([^\+,^\-]*)", chem_formula)[0]
 
 
-def process_sdf(line: Iterator):
+def process_sdf(line: Iterator, dataset="nist2020"):
     """process_sdf.
 
     Args:
         line (Iterator): line
+        dataset (str): dataset; used to select correct instrument map. Defaults to nist2020.
     """
     entry_iterator = groupby(line, key=lambda x: x.startswith(">"))
     mol_block = "".join(next(entry_iterator)[1])
@@ -170,6 +190,9 @@ def process_sdf(line: Iterator):
         elif name == "NISTNO":
             output_dict[name] = data
             output_dict["spec_id"] = f"nist_{data}"
+        elif name == "INSTRUMENT TYPE":
+            # toggle instrument choice based on dataset
+            output_dict[name] = DATASET_INSTRUMENT_MAP[dataset].get(data, data)
         else:
             output_dict[name] = data
 
@@ -218,7 +241,7 @@ def merge_data(collision_dict: dict):
     return (info_dict, peak_list)
 
 
-def dump_fn(entry: tuple) -> (dict, dict):
+def dump_fn(entry: tuple, dataset="nist2020") -> (dict, dict):
     # Create output entry
     entry, peaks = entry
     output_name = entry["spec_id"]
@@ -226,12 +249,14 @@ def dump_fn(entry: tuple) -> (dict, dict):
     formula = entry["FORMULA"]
     ionization = entry["PRECURSOR TYPE"]
     parent_mass = entry["PRECURSOR M/Z"]
+    instrument = entry["INSTRUMENT TYPE"]
     out_entry = {
-        "dataset": "nist2020", # or "nist2023",
+        "dataset": dataset, # nist2020 or nist2023
         "spec": output_name,
         "name": common_name,
         "formula": formula,
         "ionization": ionization,
+        "instrument": instrument,
         "smiles": entry["smiles"],
         "inchikey": entry["INCHIKEY"],
         "precursor": parent_mass,
@@ -287,6 +312,7 @@ def read_sdf(input_file, debug=False):
 
 def fails_filter(entry, valid_adduct=list(common.ion2mass.keys()),
                  max_mass=1500,
+                 dataset="nist2020",
                  ):
     """ fails_filter. """
     if entry['PRECURSOR TYPE'] not in valid_adduct:
@@ -296,7 +322,7 @@ def fails_filter(entry, valid_adduct=list(common.ion2mass.keys()),
         return True
 
     # QTOF, HCD,
-    if entry['INSTRUMENT TYPE'].upper() != "HCD":
+    if entry['INSTRUMENT TYPE'] not in DATASET_INSTRUMENT_MAP[dataset].values():
         return True
 
     form_els = get_els(entry['FORMULA'])
@@ -315,10 +341,12 @@ if __name__ == "__main__":
                         default=32)
     parser.add_argument("--targ-dir", action="store",
                         default="../processed_data/")
+    parser.add_argument("--dataset", action="store",
+                        default="nist2020")
     args = parser.parse_args()
     debug = args.debug
     workers = args.workers
-
+    dataset = args.dataset  
     target_directory = args.targ_dir
     input_file = args.input_file
 
@@ -337,7 +365,7 @@ if __name__ == "__main__":
     lines_to_process = read_sdf(input_file, debug=debug)
 
     print("Parallelizing smiles processing")
-    process_sdf_temp = partial(process_sdf)
+    process_sdf_temp = partial(process_sdf, dataset=dataset)
     if debug:
         output_dicts = [process_sdf_temp(i) for i in tqdm(lines_to_process)]
     else:
@@ -360,7 +388,7 @@ if __name__ == "__main__":
         precursor_type = output_dict["PRECURSOR TYPE"]
         instrument_type = output_dict["INSTRUMENT TYPE"]
         collision_energy = output_dict["COLLISION ENERGY"]
-        spec_type = output_dict["SPECTRUM TYPE"]
+        spec_type = output_dict["SPECTRUM TYPE"] # TODO: note that MS2 and MS3 spectra can be aggregated here
         precursor_mass = output_dict["PRECURSOR M/Z"]
         spec_types.append(spec_type)
         col_energies = re.findall(COLLISION_REGEX, collision_energy)
@@ -389,7 +417,7 @@ if __name__ == "__main__":
 
     print(f"Export to file")
     if debug:
-        output_tuples = [dump_fn(i) for i in merged_entries]
+        output_tuples = [dump_fn(i, dataset=dataset) for i in merged_entries]
     else:
         output_tuples = chunked_parallel(merged_entries, dump_fn, 10000,
                                           max_cpu=workers)
@@ -403,8 +431,8 @@ if __name__ == "__main__":
     h5.write_dict(ms_entries)
     h5.close()
 
-    mgf_out = build_mgf_str(merged_entries)
-    open(target_mgf / "nist_all.mgf", "w").write(mgf_out)
+    mgf_out = build_mgf_str(merged_entries, dataset=dataset)
+    open(target_mgf / f"nist_all_{dataset}.mgf", "w").write(mgf_out)
 
     df = pd.DataFrame(output_entries)
 
